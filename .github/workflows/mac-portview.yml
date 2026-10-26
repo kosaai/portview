@@ -71,8 +71,16 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
-          APP="$RUNNER_TEMP/iOSBuild/Build/Products/Release-iphoneos/PortviewClient.app"
-          test -d "$APP"
+          # The host app lands in the HostBuild derived data, under Debug
+          # (the build above is -configuration Debug). The iOS client is built
+          # in the next step into a different derived data path.
+          APP="$RUNNER_TEMP/HostBuild/Build/Products/Debug/PortviewHost.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::PortviewHost.app was not found."
+            find "$RUNNER_TEMP/HostBuild/Build/Products" \
+              -maxdepth 5 -name '*.app' -print
+            exit 1
+          fi
 
           ditto "$APP" "$GITHUB_WORKSPACE/output/Portview Host.app"
           echo "Mac Host build completed."
@@ -85,8 +93,15 @@ jobs:
           set -euo pipefail
 
           ENT="apps/PortviewClient/PortviewClient.entitlements"
+          ENT_BACKUP="$(mktemp)"
 
           if [ -f "$ENT" ]; then
+            cp "$ENT" "$ENT_BACKUP"
+
+            # aps-environment and the iCloud container are account-gated: they
+            # need a provisioning profile, which this unsigned CI build has no
+            # way to mint. Drop them so the Release build can proceed without
+            # signing, then restore the tracked file.
             /usr/libexec/PlistBuddy \
               -c "Delete :aps-environment" "$ENT" 2>/dev/null || true
 
@@ -99,6 +114,13 @@ jobs:
               "$ENT" 2>/dev/null || true
           fi
 
+          cleanup_ent() {
+            if [ -f "$ENT_BACKUP" ]; then
+              mv -f "$ENT_BACKUP" "$ENT"
+            fi
+          }
+          trap cleanup_ent EXIT
+
           xcodebuild \
             -project apps/PortviewClient/PortviewClient.xcodeproj \
             -scheme PortviewClient \
@@ -108,17 +130,26 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
-          APP="$RUNNER_TEMP/iOSBuild/Build/Products/Release-iphoneos/Portview.app"
+          # The client target is named PortviewClient, so that is the bundle
+          # that lands in Release-iphoneos. Locate it rather than hardcoding a
+          # name that may not match the target.
+          APP="$(find "$RUNNER_TEMP/iOSBuild/Build/Products/Release-iphoneos" \
+            -maxdepth 1 -name '*.app' -print -quit 2>/dev/null || true)"
 
-          if [ ! -d "$APP" ]; then
-            echo "::error::Portview.app was not found."
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+            echo "::error::iOS .app was not found."
             find "$RUNNER_TEMP/iOSBuild/Build/Products" \
               -maxdepth 5 -name '*.app' -print
             exit 1
           fi
 
+          echo "Found iOS app: $APP"
+
           PACKAGE="$RUNNER_TEMP/ipa"
+          rm -rf "$PACKAGE"
           mkdir -p "$PACKAGE/Payload"
+
+          # Rename to a stable bundle name for the IPA.
           ditto "$APP" "$PACKAGE/Payload/Portview.app"
 
           cd "$PACKAGE"
