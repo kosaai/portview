@@ -24,39 +24,7 @@ jobs:
       SESSION_DURATION: ${{ inputs.duration }}
 
     steps:
-      - name: Connect Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          args: --accept-dns=false
-
-      - name: Verify DNS and GitHub access
-        shell: bash
-        timeout-minutes: 3
-        run: |
-          set -euo pipefail
-
-          echo "Checking GitHub DNS..."
-          DNS_OK=0
-
-          for i in {1..6}; do
-            if dscacheutil -q host -a name github.com | grep -q 'ip_address'; then
-              DNS_OK=1
-              break
-            fi
-            sleep 5
-          done
-
-          if [ "$DNS_OK" -ne 1 ]; then
-            echo "::error::Cannot resolve github.com"
-            scutil --dns || true
-            exit 1
-          fi
-
-          echo "Checking GitHub HTTPS..."
-          curl --connect-timeout 10 --max-time 20 -fsSI https://github.com/ >/dev/null
-          echo "GitHub DNS and HTTPS are working."
-
+      # 1. Download source BEFORE connecting Tailscale
       - name: Checkout Portview source
         uses: actions/checkout@v4
         with:
@@ -66,58 +34,18 @@ jobs:
 
       - name: Install tools and RustDesk
         shell: bash
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
           set -euo pipefail
 
           xcodebuild -version
-
-          if ! command -v xcodegen >/dev/null 2>&1; then
-            brew install xcodegen
-          fi
+          brew install xcodegen
 
           if [ ! -d "/Applications/RustDesk.app" ]; then
             brew install --cask rustdesk
           fi
 
-          mkdir -p "$HOME/Desktop/PortviewBuild"
-          open -a RustDesk || true
-          sleep 10
-
-      - name: Configure RustDesk
-        shell: bash
-        env:
-          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORD }}
-        run: |
-          set -euo pipefail
-
-          RUSTDESK_BIN="/Applications/RustDesk.app/Contents/MacOS/rustdesk"
-
-          if [ -z "${RUSTDESK_PASSWORD:-}" ]; then
-            echo "::error::Add RUSTDESK_PASSWORD in GitHub Actions Secrets."
-            exit 1
-          fi
-
-          "$RUSTDESK_BIN" --password "$RUSTDESK_PASSWORD"
-
-          sleep 5
-          RUSTDESK_ID="$("$RUSTDESK_BIN" --get-id 2>/dev/null || true)"
-          TS_IP="$(tailscale ip -4 2>/dev/null | head -1 || true)"
-
-          if [ -z "$RUSTDESK_ID" ]; then
-            echo "::error::Could not retrieve RustDesk ID."
-            exit 1
-          fi
-
-          {
-            echo "RustDesk ID: $RUSTDESK_ID"
-            echo "Tailscale IP: ${TS_IP:-Unavailable}"
-            echo "RustDesk password: use GitHub Secret RUSTDESK_PASSWORD"
-          } > "$HOME/Desktop/PortviewBuild/connection-info.txt"
-
-          chmod 600 "$HOME/Desktop/PortviewBuild/connection-info.txt"
-          echo "RustDesk ID: $RUSTDESK_ID"
-          echo "Tailscale IP: ${TS_IP:-Unavailable}"
+          mkdir -p "$GITHUB_WORKSPACE/output"
 
       - name: Generate Xcode projects
         shell: bash
@@ -130,7 +58,7 @@ jobs:
       - name: Build Mac Host
         shell: bash
         working-directory: portview
-        timeout-minutes: 40
+        timeout-minutes: 45
         run: |
           set -euo pipefail
 
@@ -146,10 +74,7 @@ jobs:
           APP="$RUNNER_TEMP/HostBuild/Build/Products/Debug/PortviewHost.app"
           test -d "$APP"
 
-          mkdir -p "$HOME/Desktop"
-          ditto "$APP" "$HOME/Desktop/Portview Host.app"
-
-          open "$HOME/Desktop/Portview Host.app" || true
+          ditto "$APP" "$GITHUB_WORKSPACE/output/Portview Host.app"
           echo "Mac Host build completed."
 
       - name: Build unsigned iPhone IPA
@@ -161,8 +86,6 @@ jobs:
 
           ENT="apps/PortviewClient/PortviewClient.entitlements"
 
-          # Remove upstream account-specific capabilities from this
-          # temporary checkout only.
           if [ -f "$ENT" ]; then
             /usr/libexec/PlistBuddy \
               -c "Delete :aps-environment" "$ENT" 2>/dev/null || true
@@ -188,38 +111,85 @@ jobs:
           APP="$RUNNER_TEMP/iOSBuild/Build/Products/Release-iphoneos/Portview.app"
 
           if [ ! -d "$APP" ]; then
-            echo "::error::Portview.app not found after build."
+            echo "::error::Portview.app was not found."
             find "$RUNNER_TEMP/iOSBuild/Build/Products" \
               -maxdepth 5 -name '*.app' -print
             exit 1
           fi
 
-          OUT="$RUNNER_TEMP/ipa"
-          mkdir -p "$OUT/Payload"
-          ditto "$APP" "$OUT/Payload/Portview.app"
+          PACKAGE="$RUNNER_TEMP/ipa"
+          mkdir -p "$PACKAGE/Payload"
+          ditto "$APP" "$PACKAGE/Payload/Portview.app"
 
-          cd "$OUT"
+          cd "$PACKAGE"
           /usr/bin/ditto -c -k --sequesterRsrc --keepParent \
-            Payload "$HOME/Desktop/Portview.ipa"
+            Payload "$GITHUB_WORKSPACE/output/Portview.ipa"
 
-          test -s "$HOME/Desktop/Portview.ipa"
-          echo "IPA package created."
+          test -s "$GITHUB_WORKSPACE/output/Portview.ipa"
+          echo "Unsigned IPA package created."
 
-      - name: Upload outputs
+      # 2. Upload artifacts BEFORE connecting Tailscale
+      - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Portview-macOS27-${{ github.run_id }}
-          path: |
-            /Users/runner/Desktop/Portview.ipa
-            /Users/runner/Desktop/Portview Host.app
-            /Users/runner/Desktop/PortviewBuild/connection-info.txt
+          name: Portview-build-${{ github.run_id }}
+          path: output/
           if-no-files-found: warn
           retention-days: 1
 
+      # 3. Connect only after downloads, builds and upload are finished
+      - name: Connect Tailscale
+        id: tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          args: --accept-dns=false
+
+      - name: Configure RustDesk and show connection details
+        if: steps.tailscale.outcome == 'success'
+        shell: bash
+        env:
+          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${RUSTDESK_PASSWORD:-}" ]; then
+            echo "::error::Add RUSTDESK_PASSWORD to GitHub Actions Secrets."
+            exit 1
+          fi
+
+          open -a RustDesk || true
+          sleep 10
+
+          RUSTDESK_BIN="/Applications/RustDesk.app/Contents/MacOS/rustdesk"
+          "$RUSTDESK_BIN" --password "$RUSTDESK_PASSWORD"
+          sleep 5
+
+          RUSTDESK_ID=""
+          for i in {1..6}; do
+            RUSTDESK_ID="$("$RUSTDESK_BIN" --get-id 2>/dev/null || true)"
+            [ -n "$RUSTDESK_ID" ] && break
+            sleep 5
+          done
+
+          TS_IP="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+
+          echo "=================================="
+          echo "RustDesk ID: ${RUSTDESK_ID:-Unavailable}"
+          echo "Tailscale IP: ${TS_IP:-Unavailable}"
+          echo "Use your RUSTDESK_PASSWORD secret as the password."
+          echo "=================================="
+
+          if [ -z "$RUSTDESK_ID" ]; then
+            echo "::warning::RustDesk ID could not be retrieved."
+          fi
+
+          open "$GITHUB_WORKSPACE/output/Portview Host.app" || true
+
       - name: Keep session alive
-        if: success()
+        if: steps.tailscale.outcome == 'success'
         shell: bash
         run: |
-          echo "Keeping session alive for ${SESSION_DURATION} hour(s)."
+          echo "Session will remain active for ${SESSION_DURATION} hour(s)."
           sleep "$((SESSION_DURATION * 3600))"
