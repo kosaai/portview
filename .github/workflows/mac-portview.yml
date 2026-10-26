@@ -1,0 +1,202 @@
+
+name: Portview Mac 27 + RustDesk + iPhone IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Session duration (hours)"
+        required: true
+        default: "2"
+        type: choice
+        options: ["1", "2", "3", "4", "5", "6"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Portview on macOS 27
+    runs-on: xcode-27
+    timeout-minutes: 360
+
+    env:
+      SESSION_DURATION: ${{ inputs.duration }}
+
+    steps:
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          args: --accept-dns=false
+
+      - name: Install tools and RustDesk
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          brew install --cask rustdesk
+
+          mkdir -p "$HOME/Desktop"
+          open -a RustDesk || true
+          sleep 10
+
+      - name: Prepare remote access credentials
+        id: remote
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MAC_USER="$(id -un)"
+          MAC_PASSWORD="$(openssl rand -hex 16)"
+          RUSTDESK_PASSWORD="$(openssl rand -hex 16)"
+
+          echo "::add-mask::$MAC_PASSWORD"
+          echo "::add-mask::$RUSTDESK_PASSWORD"
+
+          # Set a password for the current runner account.
+          sudo dscl . -passwd "/Users/$MAC_USER" "$MAC_PASSWORD"
+
+          RUSTDESK_BIN="/Applications/RustDesk.app/Contents/MacOS/rustdesk"
+
+          "$RUSTDESK_BIN" --password "$RUSTDESK_PASSWORD" || true
+          sleep 10
+
+          RUSTDESK_ID="$("$RUSTDESK_BIN" --get-id 2>/dev/null || true)"
+          TS_IP="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+
+          mkdir -p "$HOME/Desktop/PortviewBuild"
+          {
+            echo "MAC_USER=$MAC_USER"
+            echo "MAC_PASSWORD=$MAC_PASSWORD"
+            echo "RUSTDESK_ID=$RUSTDESK_ID"
+            echo "RUSTDESK_PASSWORD=$RUSTDESK_PASSWORD"
+            echo "TAILSCALE_IP=$TS_IP"
+          } > "$HOME/Desktop/PortviewBuild/connection-info.txt"
+
+          chmod 600 "$HOME/Desktop/PortviewBuild/connection-info.txt"
+
+          echo "MAC_USER=$MAC_USER" >> "$GITHUB_ENV"
+          echo "RUSTDESK_ID=$RUSTDESK_ID" >> "$GITHUB_ENV"
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+
+      - name: Download Portview source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            https://github.com/TaylorFinklea/portview.git \
+            "$RUNNER_TEMP/portview"
+
+          cd "$RUNNER_TEMP/portview"
+          git rev-parse HEAD
+
+      - name: Prepare local build configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/portview"
+
+          # Use a separate bundle-ID prefix and avoid relying on the
+          # upstream maintainer's signing team.
+          cat > apps/Portview.local.xcconfig <<'EOF'
+          PORTVIEW_DEVELOPMENT_TEAM =
+          PORTVIEW_BUNDLE_ID_PREFIX = com.portviewbuild
+          EOF
+
+          # The unsigned IPA will be signed later by the user.
+          # Remove capabilities tied to the upstream iCloud account.
+          /usr/libexec/PlistBuddy \
+            -c "Delete :aps-environment" \
+            apps/PortviewClient/PortviewClient.entitlements 2>/dev/null || true
+
+          /usr/libexec/PlistBuddy \
+            -c "Delete :com.apple.developer.icloud-container-identifiers" \
+            apps/PortviewClient/PortviewClient.entitlements 2>/dev/null || true
+
+          /usr/libexec/PlistBuddy \
+            -c "Delete :com.apple.developer.icloud-services" \
+            apps/PortviewClient/PortviewClient.entitlements 2>/dev/null || true
+
+          (cd apps/PortviewHost && xcodegen generate)
+          (cd apps/PortviewClient && xcodegen generate)
+
+      - name: Build and launch Mac Host
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/portview"
+
+          xcodebuild \
+            -project apps/PortviewHost/PortviewHost.xcodeproj \
+            -scheme PortviewHost \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/HostDerivedData" \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=- \
+            build
+
+          HOST_APP="$(find "$RUNNER_TEMP/HostDerivedData/Build/Products/Debug" \
+            -maxdepth 1 -name 'PortviewHost.app' -print -quit)"
+
+          test -d "$HOST_APP"
+          ditto "$HOST_APP" "$HOME/Desktop/Portview Host.app"
+          open "$HOME/Desktop/Portview Host.app" || true
+
+          echo "Mac Host build completed."
+
+      - name: Build unsigned iPhone IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/portview"
+
+          ARCHIVE="$RUNNER_TEMP/PortviewClient.xcarchive"
+          EXPORT_DIR="$RUNNER_TEMP/ipa-output"
+          mkdir -p "$EXPORT_DIR"
+
+          xcodebuild archive \
+            -project apps/PortviewClient/PortviewClient.xcodeproj \
+            -scheme PortviewClient \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            | tee "$RUNNER_TEMP/ios-archive.log"
+
+          APP="$ARCHIVE/Products/Applications/Portview.app"
+          test -d "$APP"
+
+          mkdir -p "$EXPORT_DIR/Payload"
+          ditto "$APP" "$EXPORT_DIR/Payload/Portview.app"
+
+          cd "$EXPORT_DIR"
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent \
+            Payload "$HOME/Desktop/Portview.ipa"
+
+          test -s "$HOME/Desktop/Portview.ipa"
+          echo "Unsigned IPA created on Desktop."
+
+      - name: Save build outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Portview-macOS27-${{ github.run_id }}
+          path: |
+            ~/Desktop/Portview.ipa
+            ~/Desktop/Portview Host.app
+            ~/Desktop/PortviewBuild/connection-info.txt
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Keep session alive
+        if: always()
+        shell: bash
+        run: |
+          HOURS="${SESSION_DURATION:-2}"
+          echo "Requested session: $HOURS hour(s)."
+          sleep "$((HOURS * 3600))"
