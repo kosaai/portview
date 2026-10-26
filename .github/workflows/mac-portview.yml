@@ -92,7 +92,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          ENT="apps/PortviewClient/PortviewClient.entitlements"
+          # Absolute path: the step later does `cd` into the packaging dir, and
+          # a relative path in the restore trap would then miss.
+          ENT="$GITHUB_WORKSPACE/portview/apps/PortviewClient/PortviewClient.entitlements"
           ENT_BACKUP="$(mktemp)"
 
           if [ -f "$ENT" ]; then
