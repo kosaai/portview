@@ -41,32 +41,6 @@ final class ReWakeCenter: ObservableObject {
     /// fingerprint hex) so a tap can select the saved Mac to reconnect.
     nonisolated static let notificationPinHexKey = "portviewReWakePinHex"
 
-    /// The iCloud container entitlement key, spelled as bytes on purpose: if the
-    /// literal appeared in this file the binary would contain it, and the scan
-    /// below would then always report the entitlement as present.
-    nonisolated private static let iCloudEntitlementKey: [UInt8] = [
-        99, 111, 109, 46, 97, 112, 112, 108, 101, 46, 100, 101, 118, 101,
-        108, 111, 112, 101, 114, 46, 105, 99, 108, 111, 117, 100, 45, 99,
-        111, 110, 116, 97, 105, 110, 101, 114, 45, 105, 100, 101, 110, 116,
-        105, 102, 105, 101, 114, 115,
-    ]
-
-    /// Whether this build carries the iCloud container entitlement.
-    ///
-    /// iOS exposes no public API for reading entitlements at runtime
-    /// (`SecTaskCopyValueForEntitlement` is macOS-only, and `Bundle` has no
-    /// `entitlements` member), so read them off the code signature embedded in
-    /// the executable: the entitlements blob carries the key as a literal. A
-    /// build with no entitlements — the shared CI strips them so the Release
-    /// build can proceed unsigned — has no blob, so the key is absent.
-    /// `CKContainer(identifier:)` raises an uncatchable Objective-C
-    /// `CKException` without the entitlement, so callers must check first.
-    nonisolated static var hasICloudContainerEntitlement: Bool {
-        guard let exe = Bundle.main.executableURL else { return false }
-        guard let data = try? Data(contentsOf: exe, options: [.mappedIfSafe]) else { return false }
-        return data.range(of: Data(Self.iCloudEntitlementKey)) != nil
-    }
-
     /// Hard ceiling on one push's total handling (fetch + probe + post) — comfortably inside the
     /// ~30 s background budget so the completion handler is never starved.
     nonisolated private static let pushBudget: TimeInterval = 25
@@ -159,15 +133,6 @@ final class ReWakeCenter: ObservableObject {
 
     private func bootstrapIfNeeded() async {
         guard !bootstrapped, !bootstrapInFlight else { return }
-        // A CI/ad-hoc build may carry no iCloud entitlement (the shared CI strips
-        // aps-environment and the container identifiers so the Release build can
-        // proceed unsigned). CKContainer(identifier:) raises an Objective-C
-        // CKException there, which Swift's do/catch cannot intercept — so the app
-        // would die at launch. Check the entitlement first and skip re-wake.
-        guard Self.hasICloudContainerEntitlement else {
-            bootstrapped = true  // never retry: this build cannot use CloudKit
-            return
-        }
         bootstrapInFlight = true
         defer { bootstrapInFlight = false }
         let database = CKContainer(identifier: Self.containerIdentifier).privateCloudDatabase
