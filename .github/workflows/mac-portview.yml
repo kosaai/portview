@@ -28,7 +28,7 @@ jobs:
       - name: Checkout Portview source
         uses: actions/checkout@v4
         with:
-          repository: TaylorFinklea/portview
+          repository: kosaai/portview
           ref: main
           path: portview
 
