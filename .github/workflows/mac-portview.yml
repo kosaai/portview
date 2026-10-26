@@ -71,7 +71,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
-          APP="$RUNNER_TEMP/HostBuild/Build/Products/Debug/PortviewHost.app"
+          APP="$RUNNER_TEMP/iOSBuild/Build/Products/Release-iphoneos/PortviewClient.app"
           test -d "$APP"
 
           ditto "$APP" "$GITHUB_WORKSPACE/output/Portview Host.app"
