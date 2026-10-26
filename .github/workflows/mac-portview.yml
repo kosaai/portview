@@ -83,6 +83,21 @@ jobs:
           fi
 
           ditto "$APP" "$GITHUB_WORKSPACE/output/Portview Host.app"
+
+          # Ad-hoc sign so the bundle has a valid signature: a menubar app that
+          # requests Screen Recording needs one, and an unsigned bundle is
+          # rejected at launch.
+          HOST_ENT="$GITHUB_WORKSPACE/portview/apps/PortviewHost/PortviewHost.entitlements"
+          if [ -f "$HOST_ENT" ]; then
+            /usr/bin/codesign --force --sign - \
+              --entitlements "$HOST_ENT" \
+              --identifier dev.finklea.portview.host \
+              "$GITHUB_WORKSPACE/output/Portview Host.app"
+          else
+            /usr/bin/codesign --force --sign - \
+              "$GITHUB_WORKSPACE/output/Portview Host.app"
+          fi
+
           echo "Mac Host build completed."
 
       - name: Build unsigned iPhone IPA
@@ -92,37 +107,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Absolute path: the step later does `cd` into the packaging dir, and
-          # a relative path in the restore trap would then miss.
-          ENT="$GITHUB_WORKSPACE/portview/apps/PortviewClient/PortviewClient.entitlements"
-          ENT_BACKUP="$(mktemp)"
-
-          if [ -f "$ENT" ]; then
-            cp "$ENT" "$ENT_BACKUP"
-
-            # aps-environment and the iCloud container are account-gated: they
-            # need a provisioning profile, which this unsigned CI build has no
-            # way to mint. Drop them so the Release build can proceed without
-            # signing, then restore the tracked file.
-            /usr/libexec/PlistBuddy \
-              -c "Delete :aps-environment" "$ENT" 2>/dev/null || true
-
-            /usr/libexec/PlistBuddy \
-              -c "Delete :com.apple.developer.icloud-container-identifiers" \
-              "$ENT" 2>/dev/null || true
-
-            /usr/libexec/PlistBuddy \
-              -c "Delete :com.apple.developer.icloud-services" \
-              "$ENT" 2>/dev/null || true
-          fi
-
-          cleanup_ent() {
-            if [ -f "$ENT_BACKUP" ]; then
-              mv -f "$ENT_BACKUP" "$ENT"
-            fi
-          }
-          trap cleanup_ent EXIT
-
+          # Keep the entitlements file untouched. An earlier revision stripped
+          # aps-environment and the iCloud container so the Release build could
+          # go unsigned — but the Info.plist still declares
+          # UIBackgroundModes: remote-notification, and iOS kills an app at
+          # launch whose declared background modes are not backed by the
+          # signature. Worse, CKContainer(identifier:) then raised an
+          # uncatchable CKException. The bundle is ad-hoc signed below with the
+          # real entitlements, so nothing is left dangling.
           xcodebuild \
             -project apps/PortviewClient/PortviewClient.xcodeproj \
             -scheme PortviewClient \
@@ -147,12 +139,35 @@ jobs:
 
           echo "Found iOS app: $APP"
 
+          # Ad-hoc sign with the real entitlements so the signature backs the
+          # Info.plist's UIBackgroundModes: remote-notification and CKContainer
+          # has its container. An unsigned bundle is rejected at launch.
+          ENT="$GITHUB_WORKSPACE/portview/apps/PortviewClient/PortviewClient.entitlements"
+          if [ -f "$ENT" ]; then
+            /usr/bin/codesign --force --sign - \
+              --entitlements "$ENT" \
+              --identifier dev.finklea.portview \
+              "$APP"
+            /usr/bin/codesign --verify --verbose=2 "$APP" || true
+          else
+            /usr/bin/codesign --force --sign - "$APP"
+          fi
+
           PACKAGE="$RUNNER_TEMP/ipa"
           rm -rf "$PACKAGE"
           mkdir -p "$PACKAGE/Payload"
 
-          # Rename to a stable bundle name for the IPA.
+          # Rename to a stable bundle name for the IPA. The signature is
+          # re-applied after the rename: ditto changes the bundle path, which
+          # invalidates the ad-hoc signature's sealed contents.
           ditto "$APP" "$PACKAGE/Payload/Portview.app"
+
+          if [ -f "$ENT" ]; then
+            /usr/bin/codesign --force --sign - \
+              --entitlements "$ENT" \
+              --identifier dev.finklea.portview \
+              "$PACKAGE/Payload/Portview.app"
+          fi
 
           cd "$PACKAGE"
           /usr/bin/ditto -c -k --sequesterRsrc --keepParent \
