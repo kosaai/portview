@@ -41,6 +41,16 @@ final class ReWakeCenter: ObservableObject {
     /// fingerprint hex) so a tap can select the saved Mac to reconnect.
     nonisolated static let notificationPinHexKey = "portviewReWakePinHex"
 
+    /// Whether this build carries the iCloud container entitlement. Read from the
+    /// code-signature entitlements (not the Info.plist), because CI strips the
+    /// entitlement from the source file before building. `CKContainer(identifier:)`
+    /// throws an uncatchable `CKException` without it, so callers must check.
+    nonisolated static var hasICloudContainerEntitlement: Bool {
+        guard let entitlements = Bundle.main.entitlements else { return false }
+        return (entitlements["com.apple.developer.icloud-container-identifiers"]) != nil
+            || (entitlements["com.apple.developer.ubiquity-container-identifiers"]) != nil
+    }
+
     /// Hard ceiling on one push's total handling (fetch + probe + post) — comfortably inside the
     /// ~30 s background budget so the completion handler is never starved.
     nonisolated private static let pushBudget: TimeInterval = 25
@@ -133,6 +143,15 @@ final class ReWakeCenter: ObservableObject {
 
     private func bootstrapIfNeeded() async {
         guard !bootstrapped, !bootstrapInFlight else { return }
+        // A CI/ad-hoc build may carry no iCloud entitlement (the shared CI strips
+        // aps-environment and the container identifiers so the Release build can
+        // proceed unsigned). CKContainer(identifier:) raises an Objective-C
+        // CKException there, which Swift's do/catch cannot intercept — so the app
+        // would die at launch. Check the entitlement first and skip re-wake.
+        guard Self.hasICloudContainerEntitlement else {
+            bootstrapped = true  // never retry: this build cannot use CloudKit
+            return
+        }
         bootstrapInFlight = true
         defer { bootstrapInFlight = false }
         let database = CKContainer(identifier: Self.containerIdentifier).privateCloudDatabase
