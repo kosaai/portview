@@ -24,66 +24,52 @@ jobs:
       SESSION_DURATION: ${{ inputs.duration }}
 
     steps:
-      - name: Connect Tailscale (3-minute limit)
-        id: tailscale
-        continue-on-error: true
-        timeout-minutes: 3
+      - name: Connect Tailscale
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           args: --accept-dns=false
 
-      - name: Verify Tailscale connection
+      - name: Verify DNS and GitHub access
         shell: bash
-        timeout-minutes: 1
+        timeout-minutes: 3
         run: |
           set -euo pipefail
 
-          if ! command -v tailscale >/dev/null 2>&1; then
-            echo "::error::Tailscale CLI is unavailable after connection step."
+          echo "Checking GitHub DNS..."
+          DNS_OK=0
+
+          for i in {1..6}; do
+            if dscacheutil -q host -a name github.com | grep -q 'ip_address'; then
+              DNS_OK=1
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "$DNS_OK" -ne 1 ]; then
+            echo "::error::Cannot resolve github.com"
+            scutil --dns || true
             exit 1
           fi
 
-          python3 - <<'PY'
-          import subprocess, sys
+          echo "Checking GitHub HTTPS..."
+          curl --connect-timeout 10 --max-time 20 -fsSI https://github.com/ >/dev/null
+          echo "GitHub DNS and HTTPS are working."
 
-          try:
-              result = subprocess.run(
-                  ["tailscale", "status", "--json"],
-                  capture_output=True,
-                  text=True,
-                  timeout=20
-              )
-              if result.returncode != 0:
-                  print(result.stderr or result.stdout)
-                  sys.exit("Tailscale status failed.")
-              import json
-              data = json.loads(result.stdout)
-              if data.get("BackendState") != "Running":
-                  sys.exit(
-                      "Tailscale is not Running: "
-                      + str(data.get("BackendState"))
-                  )
-              print("Tailscale backend is Running.")
-              print("This confirms local status, not reachability to every device.")
-          except subprocess.TimeoutExpired:
-              sys.exit("Tailscale status timed out after 20 seconds.")
-          PY
-
-      - name: Checkout Portview
+      - name: Checkout Portview source
         uses: actions/checkout@v4
         with:
           repository: TaylorFinklea/portview
           ref: main
           path: portview
 
-      - name: Install build tools and RustDesk
+      - name: Install tools and RustDesk
         shell: bash
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           set -euo pipefail
 
-          command -v xcodebuild
           xcodebuild -version
 
           if ! command -v xcodegen >/dev/null 2>&1; then
@@ -98,7 +84,7 @@ jobs:
           open -a RustDesk || true
           sleep 10
 
-      - name: Configure RustDesk and save connection info
+      - name: Configure RustDesk
         shell: bash
         env:
           RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORD }}
@@ -108,34 +94,29 @@ jobs:
           RUSTDESK_BIN="/Applications/RustDesk.app/Contents/MacOS/rustdesk"
 
           if [ -z "${RUSTDESK_PASSWORD:-}" ]; then
-            echo "::error::Add RUSTDESK_PASSWORD under GitHub Actions secrets."
+            echo "::error::Add RUSTDESK_PASSWORD in GitHub Actions Secrets."
             exit 1
           fi
 
-          "$RUSTDESK_BIN" --password "$RUSTDESK_PASSWORD" || {
-            echo "::error::RustDesk password setup failed; inspect RustDesk on the runner."
-            exit 1
-          }
+          "$RUSTDESK_BIN" --password "$RUSTDESK_PASSWORD"
 
           sleep 5
-
           RUSTDESK_ID="$("$RUSTDESK_BIN" --get-id 2>/dev/null || true)"
           TS_IP="$(tailscale ip -4 2>/dev/null | head -1 || true)"
 
           if [ -z "$RUSTDESK_ID" ]; then
-            echo "::error::RustDesk ID could not be retrieved."
+            echo "::error::Could not retrieve RustDesk ID."
             exit 1
           fi
 
           {
             echo "RustDesk ID: $RUSTDESK_ID"
             echo "Tailscale IP: ${TS_IP:-Unavailable}"
-            echo "RustDesk password: stored in GitHub Secret RUSTDESK_PASSWORD"
+            echo "RustDesk password: use GitHub Secret RUSTDESK_PASSWORD"
           } > "$HOME/Desktop/PortviewBuild/connection-info.txt"
 
           chmod 600 "$HOME/Desktop/PortviewBuild/connection-info.txt"
-
-          echo "RustDesk ID retrieved."
+          echo "RustDesk ID: $RUSTDESK_ID"
           echo "Tailscale IP: ${TS_IP:-Unavailable}"
 
       - name: Generate Xcode projects
@@ -149,7 +130,7 @@ jobs:
       - name: Build Mac Host
         shell: bash
         working-directory: portview
-        timeout-minutes: 30
+        timeout-minutes: 40
         run: |
           set -euo pipefail
 
@@ -165,26 +146,23 @@ jobs:
           APP="$RUNNER_TEMP/HostBuild/Build/Products/Debug/PortviewHost.app"
           test -d "$APP"
 
-          codesign --force --deep --sign - "$APP"
-
           mkdir -p "$HOME/Desktop"
           ditto "$APP" "$HOME/Desktop/Portview Host.app"
 
           open "$HOME/Desktop/Portview Host.app" || true
+          echo "Mac Host build completed."
 
-          echo "Mac Host built. GUI permissions may still require manual approval."
-
-      - name: Build unsigned iPhone app
+      - name: Build unsigned iPhone IPA
         shell: bash
         working-directory: portview
-        timeout-minutes: 40
+        timeout-minutes: 45
         run: |
           set -euo pipefail
 
-          # Remove upstream account-specific capabilities from this
-          # temporary checkout only; this does not modify your repository.
           ENT="apps/PortviewClient/PortviewClient.entitlements"
 
+          # Remove upstream account-specific capabilities from this
+          # temporary checkout only.
           if [ -f "$ENT" ]; then
             /usr/libexec/PlistBuddy \
               -c "Delete :aps-environment" "$ENT" 2>/dev/null || true
@@ -210,8 +188,9 @@ jobs:
           APP="$RUNNER_TEMP/iOSBuild/Build/Products/Release-iphoneos/Portview.app"
 
           if [ ! -d "$APP" ]; then
-            echo "::error::Expected Portview.app was not found. Inspect the Xcode build log."
-            find "$RUNNER_TEMP/iOSBuild/Build/Products" -maxdepth 4 -name '*.app' -print
+            echo "::error::Portview.app not found after build."
+            find "$RUNNER_TEMP/iOSBuild/Build/Products" \
+              -maxdepth 5 -name '*.app' -print
             exit 1
           fi
 
@@ -224,17 +203,17 @@ jobs:
             Payload "$HOME/Desktop/Portview.ipa"
 
           test -s "$HOME/Desktop/Portview.ipa"
-          echo "Unsigned IPA package created."
+          echo "IPA package created."
 
-      - name: Upload build files
+      - name: Upload outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Portview-macOS27-${{ github.run_id }}
           path: |
-            ~/Desktop/Portview.ipa
-            ~/Desktop/Portview Host.app
-            ~/Desktop/PortviewBuild/connection-info.txt
+            /Users/runner/Desktop/Portview.ipa
+            /Users/runner/Desktop/Portview Host.app
+            /Users/runner/Desktop/PortviewBuild/connection-info.txt
           if-no-files-found: warn
           retention-days: 1
 
@@ -242,5 +221,5 @@ jobs:
         if: success()
         shell: bash
         run: |
-          echo "Keeping runner alive for ${SESSION_DURATION} hour(s)."
+          echo "Keeping session alive for ${SESSION_DURATION} hour(s)."
           sleep "$((SESSION_DURATION * 3600))"
